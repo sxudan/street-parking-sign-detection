@@ -1,0 +1,7 @@
+.env
+report/
+__pycache__/
+*.pyc
+.venv/
+venv/
+api_results/

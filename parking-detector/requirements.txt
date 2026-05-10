@@ -1,0 +1,17 @@
+requests>=2.31,<3
+python-dotenv>=1.0,<2
+
+# OpenCV (headless = no GUI dependencies, smaller install).
+opencv-python-headless>=4.8,<5
+
+# Tesseract OCR Python wrapper. Requires the tesseract BINARY too,
+# installed separately - see README for OS-specific install.
+pytesseract>=0.3.10,<0.4
+
+# numpy is pulled in by opencv but pin a recent line to avoid surprises.
+numpy>=1.24
+
+# FastAPI server (only needed if you run api.py).
+fastapi>=0.110,<1
+uvicorn[standard]>=0.27,<1
+pydantic>=2.5,<3
