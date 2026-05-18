@@ -1,11 +1,21 @@
+# Python 3.10 - 3.12 recommended. Python 3.13/3.14 currently lack
+# onnxruntime wheels (and therefore RapidOCR), so create the venv with
+# `python3.12 -m venv .venv` if your system default is newer.
+
 requests>=2.31,<3
 python-dotenv>=1.0,<2
 
 # OpenCV (headless = no GUI dependencies, smaller install).
 opencv-python-headless>=4.8,<5
 
-# Tesseract OCR Python wrapper. Requires the tesseract BINARY too,
-# installed separately - see README for OS-specific install.
+# RapidOCR — PaddleOCR PP-OCR models exported to ONNX. Default backend.
+# Pure pip install (~50 MB), bundled models, no torch/paddle deps.
+# Requires Python <=3.12 because of the underlying onnxruntime wheels.
+rapidocr-onnxruntime>=1.3,<2
+
+# Tesseract OCR Python wrapper. Fallback backend (set OCR_BACKEND=tesseract).
+# Requires the tesseract BINARY too, installed separately - see README for
+# OS-specific install.
 pytesseract>=0.3.10,<0.4
 
 # numpy is pulled in by opencv but pin a recent line to avoid surprises.

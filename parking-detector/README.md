@@ -103,10 +103,24 @@ real.
 
 1. **Python 3.9+**.
 2. **A Google Cloud API key** with Geocoding API + Street View Static API enabled.
-3. **Tesseract OCR installed on your system** (binary, not just the Python wrapper).
-4. **OpenCV** (Python wheel — installed automatically by `pip`).
+3. **OpenCV** (Python wheel — installed automatically by `pip`).
+4. (Optional, for the Tesseract fallback only) the **Tesseract binary** on your PATH.
 
-### Install Tesseract
+### OCR backend
+
+Two backends are available, selected by the `OCR_BACKEND` env var:
+
+| Backend     | Default | Install                                    | Notes                                                        |
+|-------------|---------|--------------------------------------------|--------------------------------------------------------------|
+| `rapid`     | ✅      | `pip install -r requirements.txt`           | RapidOCR — PaddleOCR PP-OCR models in ONNX. No system deps.  |
+| `tesseract` |         | needs `tesseract` binary (see below)        | Original pipeline. Slower and noisier on streetscape text.   |
+
+The default (`rapid`) is recommended — it produces dramatically cleaner
+output on parking signs without the per-image preprocessing tuning Tesseract
+needs. Tesseract is kept as a fallback for environments where shipping the
+ONNX runtime isn't viable, or for A/B comparison.
+
+### Install Tesseract (only if using the `tesseract` backend)
 
 **macOS** (Homebrew):
 ```bash
@@ -121,7 +135,8 @@ sudo apt update && sudo apt install -y tesseract-ocr
 **Windows**: installer at <https://github.com/UB-Mannheim/tesseract/wiki>,
 then add `C:\Program Files\Tesseract-OCR` to your PATH.
 
-Verify: `tesseract --version` should print `tesseract 4.x` or later.
+Verify: `tesseract --version` should print `tesseract 4.x` or later, then
+run with `OCR_BACKEND=tesseract` set in your environment.
 
 ### Get the Google Maps API key
 

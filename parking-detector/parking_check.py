@@ -38,6 +38,7 @@ import json
 import math
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from html import escape
 from pathlib import Path
@@ -253,36 +254,45 @@ def streetview_metadata(lat: float, lng: float, key: str, radius: int = 50) -> d
 def discover_panos(centre_lat: float, centre_lng: float, radius_m: float,
                    key: str, *, ring_step_m: int = 15,
                    points_per_ring: int = 12, snap_radius_m: int = 10,
+                   max_workers: int = 8,
                    ) -> list[Pano]:
     """Find every distinct Street View pano within radius_m of the centre.
-    Metadata calls are FREE; this function uses ~36 probes for radius=50."""
+    Metadata calls are FREE; this function uses ~36 probes for radius=50.
+
+    Probes run in parallel (default 8 workers), since each metadata
+    request is an independent HTTP GET.
+    """
     seen: dict[str, Pano] = {}
 
-    def add(meta: dict, distance_m: float) -> None:
+    def make_pano_from_meta(meta: dict, centre_lat: float, centre_lng: float) -> Optional[Pano]:
         pid = meta.get("pano_id")
         loc = meta.get("location") or {}
-        if not pid or pid in seen:
-            return
-        seen[pid] = Pano(
+        if not pid:
+            return None
+        pano_lat = loc.get("lat")
+        pano_lng = loc.get("lng")
+        if pano_lat is None or pano_lng is None:
+            return None
+        d = haversine_m(centre_lat, centre_lng, float(pano_lat), float(pano_lng))
+        return Pano(
             pano_id=pid,
-            lat=float(loc.get("lat", 0.0)),
-            lng=float(loc.get("lng", 0.0)),
+            lat=float(pano_lat),
+            lng=float(pano_lng),
             date=meta.get("date"),
-            distance_m=float(distance_m),
+            distance_m=d,
         )
 
+    # Address pano (centre) probe — done first, with a generous radius.
     centre_meta = streetview_metadata(centre_lat, centre_lng, key, radius=50)
     if centre_meta:
-        ploc = centre_meta.get("location") or {}
-        d = (haversine_m(centre_lat, centre_lng,
-                         float(ploc.get("lat", centre_lat)),
-                         float(ploc.get("lng", centre_lng)))
-             if ploc else 0.0)
-        add(centre_meta, d)
+        p = make_pano_from_meta(centre_meta, centre_lat, centre_lng)
+        if p:
+            seen[p.pano_id] = p
 
     if radius_m <= 0:
         return sorted(seen.values(), key=lambda p: p.distance_m)
 
+    # Build ring probe coordinates
     rings = []
     r = ring_step_m
     while r <= radius_m + 0.5:
@@ -291,24 +301,29 @@ def discover_panos(centre_lat: float, centre_lng: float, radius_m: float,
     if not rings:
         rings.append(int(radius_m))
 
+    probe_coords: list[tuple[float, float]] = []
     for ring_r in rings:
         for i in range(points_per_ring):
             angle_deg = (i * 360.0 / points_per_ring) % 360.0
             east_m = ring_r * math.sin(math.radians(angle_deg))
             north_m = ring_r * math.cos(math.radians(angle_deg))
-            plat, plng = offset_metres(centre_lat, centre_lng, north_m, east_m)
-            meta = streetview_metadata(plat, plng, key, radius=snap_radius_m)
+            probe_coords.append(offset_metres(centre_lat, centre_lng, north_m, east_m))
+
+    # Parallel probes
+    def probe_one(coord):
+        plat, plng = coord
+        return streetview_metadata(plat, plng, key, radius=snap_radius_m)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for meta in ex.map(probe_one, probe_coords):
             if not meta:
                 continue
-            ploc = meta.get("location") or {}
-            pano_lat = ploc.get("lat")
-            pano_lng = ploc.get("lng")
-            if pano_lat is None or pano_lng is None:
+            p = make_pano_from_meta(meta, centre_lat, centre_lng)
+            if not p or p.pano_id in seen:
                 continue
-            d = haversine_m(centre_lat, centre_lng, pano_lat, pano_lng)
-            if d > radius_m + 5.0:
+            if p.distance_m > radius_m + 5.0:
                 continue
-            add(meta, d)
+            seen[p.pano_id] = p
 
     return sorted(seen.values(), key=lambda p: p.distance_m)
 
@@ -438,6 +453,66 @@ def parse_zoom_spec(spec: str) -> tuple[float, float, float]:
     return heading, fov, pitch
 
 
+@dataclass
+class _FetchTask:
+    """One concrete (pano, heading, pitch, fov) capture to perform."""
+    pano: Pano
+    heading: float
+    pitch: float
+    fov: int
+    fname: str
+    purpose: str
+
+
+def _execute_fetch_tasks(tasks: list[_FetchTask], *, size: str, key: str,
+                         images_dir: Path, use_thumbnail: bool,
+                         thumbnail_size: tuple[int, int],
+                         max_workers: int, log,
+                         ) -> list[CapturedImage]:
+    """Run all fetch tasks in parallel via a thread pool. Returns the
+    successful CapturedImage objects."""
+
+    def do_one(task: _FetchTask) -> Optional[CapturedImage]:
+        fpath = images_dir / task.fname
+        if use_thumbnail:
+            w, ht = thumbnail_size
+            ok = fetch_streetview_thumbnail(
+                pano_id=task.pano.pano_id, heading=task.heading,
+                pitch=task.pitch, width=w, height=ht, out_path=fpath,
+            )
+            recorded_fov = 0
+        else:
+            ok = fetch_streetview_image(
+                pano_id=task.pano.pano_id, heading=task.heading,
+                pitch=task.pitch, fov=task.fov, size=size, key=key,
+                out_path=fpath,
+            )
+            recorded_fov = task.fov
+        if not ok:
+            return None
+        return CapturedImage(
+            purpose=task.purpose, pano_id=task.pano.pano_id,
+            pano_date=task.pano.date,
+            pano_distance_m=task.pano.distance_m,
+            heading=task.heading, pitch=task.pitch, fov=recorded_fov,
+            lat=task.pano.lat, lng=task.pano.lng,
+            file_path=str(fpath),
+        )
+
+    captures: list[CapturedImage] = []
+    saved = 0
+    failed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for result in ex.map(do_one, tasks):
+            if result is not None:
+                captures.append(result)
+                saved += 1
+            else:
+                failed += 1
+    log(f"      fetched {saved}/{len(tasks)} ({failed} no-imagery)")
+    return captures
+
+
 def capture_pano(pano: Pano, headings: list[float], pitches: list[float],
                  fovs: list[int], size: str, key: str, images_dir: Path,
                  purpose: str, name_prefix: str, log,
@@ -504,11 +579,11 @@ def capture_pano(pano: Pano, headings: list[float], pitches: list[float],
 # ---------------------------------------------------------------------------
 
 def ocr_and_annotate_all(images: list[CapturedImage], annotated_dir: Path,
-                          do_annotate: bool, log
+                          do_annotate: bool, log,
+                          max_workers: Optional[int] = None,
                           ) -> tuple[int, dict[str, str]]:
-    """Run Tesseract on every image, populate the OCR fields in-place, and
-    (optionally) save an annotated copy with bounding boxes drawn around
-    every recognised word.
+    """Run Tesseract on every image in parallel. Tesseract's C++ work
+    releases the GIL during OCR, so threads do scale on multi-core boxes.
 
     Returns (flagged_count, annotated_paths_dict).
     """
@@ -516,36 +591,168 @@ def ocr_and_annotate_all(images: list[CapturedImage], annotated_dir: Path,
         log(f"      (OCR unavailable: {_DETECT_IMPORT_ERROR})")
         return 0, {}
     import cv2
-    flagged = 0
+
+    if max_workers is None:
+        max_workers = max(1, (os.cpu_count() or 4))
+
     annotated: dict[str, str] = {}
-    for i, img in enumerate(images, start=1):
+    flagged_count = 0
+    # We mutate `img` in place inside the worker so the caller sees results
+    # back on its CapturedImage objects.
+    def process_one(img: CapturedImage) -> tuple[bool, Optional[tuple[str, str]]]:
         bgr = cv2.imread(img.file_path)
         if bgr is None:
-            continue
+            return False, None
         result = detect_signs.ocr_image(bgr)
         img.ocr_text = result.text or (result.error or "")
         img.keywords_found = result.keywords_found
         img.keyword_score = result.keyword_score
         flag = result.keyword_score >= PARKING_FLAG_SCORE
-        if flag:
-            flagged += 1
-
-        # Annotate every image that produced any high-confidence text,
-        # not just flagged ones — the boxes are useful even when there's
-        # no parking match (you can see what Tesseract was reading).
+        ann_pair: Optional[tuple[str, str]] = None
         if do_annotate and result.word_boxes:
             ann_path = annotated_dir / Path(img.file_path).name
             ann_path.parent.mkdir(parents=True, exist_ok=True)
             ann_img = detect_signs.annotate_text(bgr, result)
             cv2.imwrite(str(ann_path), ann_img)
-            annotated[img.file_path] = str(ann_path)
+            ann_pair = (img.file_path, str(ann_path))
+        return flag, ann_pair
 
-        tag = " [PARKING]" if flag else ""
-        kw_summary = (",".join(img.keywords_found[:5]) if img.keywords_found else "-")
-        log(f"      ({i:3d}/{len(images)}) "
-            f"{Path(img.file_path).name}  "
-            f"score={result.keyword_score:.1f}  kw={kw_summary}{tag}")
-    return flagged, annotated
+    log(f"      OCR'ing {len(images)} images via {max_workers} workers...")
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for img, (flag, ann_pair) in zip(images, ex.map(process_one, images)):
+            if flag:
+                flagged_count += 1
+            if ann_pair:
+                annotated[ann_pair[0]] = ann_pair[1]
+
+    log(f"      OCR done: {flagged_count}/{len(images)} flagged as parking-like")
+    return flagged_count, annotated
+
+
+# ---------------------------------------------------------------------------
+# High-res tile upgrade for flagged images
+# ---------------------------------------------------------------------------
+
+def upgrade_flagged_with_tiles(
+    images: list[CapturedImage],
+    annotated_paths: dict[str, str],
+    images_dir: Path,
+    annotated_dir: Path,
+    *,
+    zoom: int = 4,
+    max_upgrades: int = 3,
+    log,
+) -> int:
+    """For each flagged image (up to `max_upgrades`, sorted by score desc),
+    fetch a high-resolution tile-stitched crop from streetviewpixels-pa
+    /v1/tile, re-OCR it, and if the re-OCR score is at least as good as
+    the thumbnail's, replace the image's file path + score in place.
+
+    Returns the count of images successfully upgraded.
+    """
+    if not _DETECT_OK:
+        log("      tile upgrade unavailable (cv2/pytesseract missing)")
+        return 0
+    try:
+        import tile_fetcher
+    except ImportError as exc:
+        log(f"      tile_fetcher unavailable: {exc}")
+        return 0
+    import cv2
+
+    # Pick the top N flagged by current score.
+    flagged = [i for i in images if i.keyword_score >= PARKING_FLAG_SCORE]
+    flagged.sort(key=lambda i: i.keyword_score, reverse=True)
+    flagged = flagged[:max_upgrades]
+    if not flagged:
+        return 0
+
+    log(f"      upgrading {len(flagged)} flagged image(s) to tile zoom {zoom}...")
+    upgraded = 0
+    for img in flagged:
+        old_path = Path(img.file_path)
+        new_name = old_path.stem + f"_z{zoom}_tile.jpg"
+        new_path = images_dir / new_name
+
+        cropped, stats = tile_fetcher.fetch_tile_crop(
+            pano_id=img.pano_id, heading=img.heading, pitch=img.pitch,
+            zoom=zoom, out_path=new_path, log=log,
+        )
+        if cropped is None or stats.get("tiles_fetched", 0) == 0:
+            log(f"      [skip] {old_path.name}: no tiles fetched")
+            continue
+
+        # Re-OCR the high-res crop.
+        bgr = cv2.imread(str(new_path))
+        if bgr is None:
+            log(f"      [skip] {old_path.name}: failed to read tile crop")
+            continue
+        new_reading = detect_signs.ocr_image(bgr)
+
+        # Diagnostic line — always emit so we can see what the tile
+        # crop actually contained, even when it scored low.
+        kw_str = ",".join(new_reading.keywords_found[:5]) or "none"
+        log(f"      tile-OCR    score={new_reading.keyword_score:.1f}  "
+            f"kw=[{kw_str}]  text={new_reading.text[:120]!r}")
+
+        # Replace the thumbnail with the high-res tile crop ONLY when
+        # the tile OCR is at least as good. Score is keyword-presence-
+        # based, so it should usually match or exceed the thumbnail
+        # since the tile crop is sharper.
+        if new_reading.keyword_score >= img.keyword_score:
+            img.file_path = str(new_path)
+            img.ocr_text = new_reading.text or img.ocr_text
+            img.keywords_found = new_reading.keywords_found or img.keywords_found
+            img.keyword_score = new_reading.keyword_score
+
+            if new_reading.word_boxes:
+                ann_path = annotated_dir / new_path.name
+                ann_img = detect_signs.annotate_text(bgr, new_reading)
+                cv2.imwrite(str(ann_path), ann_img)
+                old_ann = annotated_paths.pop(str(old_path), None)
+                if old_ann:
+                    try:
+                        Path(old_ann).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                annotated_paths[str(new_path)] = str(ann_path)
+
+            try:
+                old_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+            upgraded += 1
+            log(f"      [ok]   {old_path.name} -> {new_path.name}  "
+                f"score {img.keyword_score:.1f}  kw={','.join(img.keywords_found[:5])}")
+        else:
+            # Tile OCR was worse than thumbnail. Don't replace, but
+            # KEEP the tile crop on disk so the user can inspect it
+            # — this case is almost certainly a bug in the crop math
+            # or the OCR pipeline rather than a genuine quality
+            # regression. The orphaned file lives next to the
+            # thumbnail in images_dir/<job>/. Cleanup of unflagged
+            # images runs later but only deletes images that aren't in
+            # the report; this file doesn't appear in the report so it
+            # would normally get cleaned up too. To make sure it
+            # survives for debugging, we move it to a debug subdir.
+            debug_dir = images_dir.parent / "tile_debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                debug_path = debug_dir / new_path.name
+                new_path.replace(debug_path)
+                kept_msg = f"saved to {debug_path}"
+            except Exception as exc:
+                kept_msg = f"could not relocate ({exc})"
+                try:
+                    new_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            log(f"      [keep] {old_path.name}: tile re-OCR scored "
+                f"{new_reading.keyword_score:.1f} < thumbnail's {img.keyword_score:.1f} "
+                f"({kept_msg})")
+
+    return upgraded
 
 
 # ---------------------------------------------------------------------------
@@ -752,7 +959,7 @@ def run_parking_check(
     lat: Optional[float] = None,
     lng: Optional[float] = None,
     radius: float = 0.0,
-    max_panos: int = 10,
+    max_panos: Optional[int] = None,
     same_street: bool = True,
     headings_count: int = 8,
     pitches: Optional[list[float]] = None,
@@ -764,6 +971,12 @@ def run_parking_check(
     do_annotate: bool = True,
     zoom_specs: Optional[list[str]] = None,
     write_html: bool = True,
+    focus: bool = False,
+    fetch_workers: int = 8,
+    ocr_workers: Optional[int] = None,
+    image_quality: str = "fast",      # "fast" | "high"
+    max_tile_upgrades: int = 3,
+    tile_zoom: int = 4,
     log = print,
 ) -> tuple[CaptureReport, dict[str, str]]:
     """Run the full parking-check flow and return (report, annotated_paths).
@@ -820,9 +1033,18 @@ def run_parking_check(
         panos = filter_panos_same_street(panos, addr_components, google_key, log)
 
     address_pano = panos[0]
-    other_panos = panos[1:1 + max_panos]
+    # When the caller doesn't pin max_panos, scale it with the search
+    # radius so wider radii actually scan more pano(s) instead of
+    # collapsing to the same closest-10 set. Floor of 10 keeps small
+    # radii on the original behaviour; ceil(radius/5) gives 20 panos at
+    # radius=100m, 16 at 80m, etc. The schema caps this at 60 so
+    # response time stays bounded even at the outer radius limit.
+    effective_max_panos = max_panos
+    if effective_max_panos is None:
+        effective_max_panos = max(10, math.ceil(radius / 5)) if radius > 0 else 10
+    other_panos = panos[1:1 + effective_max_panos]
     log(f"      using {1 + len(other_panos)} pano(s) "
-        f"(address pano + {len(other_panos)} others)")
+        f"(address pano + {len(other_panos)} others, cap={effective_max_panos})")
     for p in [address_pano] + other_panos:
         log(f"        {p.pano_id[:14]}.. at {p.distance_m:.1f}m, date {p.date}")
 
@@ -838,24 +1060,77 @@ def run_parking_check(
             f"x {len(fovs)} fov(s) from {n_panos} pano(s) via Static API "
             f"= {n_panos * headings_count * len(pitches) * len(fovs)} images...")
 
-    addr_step = 360.0 / headings_count
-    addr_headings = [(i * addr_step) % 360.0 for i in range(headings_count)]
-    captures: list[CapturedImage] = []
-    captures.extend(capture_pano(
-        address_pano, addr_headings, pitches, fovs, size, google_key,
-        images_dir, purpose="sweep", name_prefix="addr_pano",
-        log=log, use_thumbnail=use_thumbnail, thumbnail_size=thumbnail_size,
-    ))
-    for p in other_panos:
-        bearing = bearing_deg(p.lat, p.lng, lat_resolved, lng_resolved)
-        step = 360.0 / headings_count
-        hs = [(bearing + i * step) % 360.0 for i in range(headings_count)]
-        prefix = f"radius_{int(round(p.distance_m)):03d}m_{p.pano_id[:8]}"
-        captures.extend(capture_pano(
-            p, hs, pitches, fovs, size, google_key, images_dir,
-            purpose="radius_scan", name_prefix=prefix, log=log,
-            use_thumbnail=use_thumbnail, thumbnail_size=thumbnail_size,
-        ))
+    # ---- Build the full list of fetch tasks up front, then run them all
+    # in parallel through one thread pool. This is much faster than
+    # capturing pano-by-pano serially.
+    if focus:
+        # Address pano: 4 cardinal headings instead of `headings_count`.
+        # (Risk: misses signs at NE/SE/SW/NW. Acceptable trade-off only
+        # when speed matters more than recall.)
+        addr_step = 90.0
+        n_addr = 4
+        addr_headings = [(i * addr_step) % 360.0 for i in range(n_addr)]
+        # Each radius pano: 3 headings around the bearing-toward-address,
+        # spaced 45° apart to match the normal sweep grid. So a sign that
+        # would have shown up at e.g. heading=254 in unfocused mode also
+        # shows up here.
+        radius_offsets = [-45.0, 0.0, 45.0]
+        log(f"      focus mode: {len(addr_headings)} headings on address pano, "
+            f"{len(radius_offsets)} on each radius pano (±45°)")
+    else:
+        addr_step = 360.0 / headings_count
+        addr_headings = [(i * addr_step) % 360.0 for i in range(headings_count)]
+        radius_offsets = [(i * (360.0 / headings_count)) for i in range(headings_count)]
+
+    fetch_tasks: list[_FetchTask] = []
+    # Effective FOVs for thumbnail mode collapses to a single null FOV.
+    effective_fovs = [0] if use_thumbnail else fovs
+
+    def fname_for(prefix: str, h: float, p: float, fov: int, with_fov: bool) -> str:
+        h_norm = h % 360.0
+        if h_norm >= 359.995:
+            h_norm = 0.0
+        if with_fov:
+            return (f"{prefix}_h{int(round(h_norm)):03d}"
+                    f"_p{int(round(p)):+03d}_f{int(round(fov)):03d}.jpg")
+        return (f"{prefix}_h{int(round(h_norm)):03d}"
+                f"_p{int(round(p)):+03d}_thumb.jpg")
+
+    # Address-pano tasks
+    for h in addr_headings:
+        h_norm = h % 360.0
+        if h_norm >= 359.995:
+            h_norm = 0.0
+        for p in pitches:
+            for fov in effective_fovs:
+                fetch_tasks.append(_FetchTask(
+                    pano=address_pano, heading=h_norm, pitch=p, fov=fov,
+                    fname=fname_for("addr_pano", h_norm, p, fov, not use_thumbnail),
+                    purpose="sweep",
+                ))
+
+    # Radius-pano tasks
+    for p_pano in other_panos:
+        bearing = bearing_deg(p_pano.lat, p_pano.lng, lat_resolved, lng_resolved)
+        prefix = f"radius_{int(round(p_pano.distance_m)):03d}m_{p_pano.pano_id[:8]}"
+        for off in radius_offsets:
+            h = (bearing + off) % 360.0
+            if h >= 359.995:
+                h = 0.0
+            for pp in pitches:
+                for fov in effective_fovs:
+                    fetch_tasks.append(_FetchTask(
+                        pano=p_pano, heading=h, pitch=pp, fov=fov,
+                        fname=fname_for(prefix, h, pp, fov, not use_thumbnail),
+                        purpose="radius_scan",
+                    ))
+
+    log(f"      submitting {len(fetch_tasks)} captures via {fetch_workers} workers...")
+    captures: list[CapturedImage] = _execute_fetch_tasks(
+        fetch_tasks, size=size, key=google_key, images_dir=images_dir,
+        use_thumbnail=use_thumbnail, thumbnail_size=thumbnail_size,
+        max_workers=fetch_workers, log=log,
+    )
 
     # Manual zooms (from the address pano).
     for i, spec in enumerate(zoom_specs, start=1):
@@ -898,10 +1173,19 @@ def run_parking_check(
         log(f"[4/4] OCR + annotate ({len(captures)} images)...")
         flagged, annotated_paths = ocr_and_annotate_all(
             captures, annotated_dir, do_annotate=do_annotate, log=log,
+            max_workers=ocr_workers,
         )
     else:
         flagged = 0
         log("[4/4] Skipping OCR")
+
+    # ---- 5. (optional) High-res tile upgrade for flagged images ----
+    if image_quality == "high" and do_ocr and flagged > 0:
+        upgraded = upgrade_flagged_with_tiles(
+            captures, annotated_paths, images_dir, annotated_dir,
+            zoom=tile_zoom, max_upgrades=max_tile_upgrades, log=log,
+        )
+        log(f"      tile upgrade: {upgraded} image(s) replaced with high-res versions")
 
     report = CaptureReport(
         address_query=address or "",
@@ -991,6 +1275,19 @@ def main() -> int:
                         metavar="HEADING:FOV:PITCH",
                         help="Manual zoom capture, e.g. '--zoom 252:25:-5'. "
                              "Captured from the address pano. Repeatable.")
+    parser.add_argument("--focus", action="store_true",
+                        help="Focus mode: capture only the headings most likely "
+                             "to see kerb-side parking signs. Address pano gets "
+                             "4 cardinal headings (N/E/S/W); each radius pano "
+                             "gets 3 headings (bearing-toward-address ±30°). "
+                             "Roughly halves the capture count and OCR time.")
+    parser.add_argument("--fetch-workers", type=int, default=8,
+                        help="Concurrent threads for image fetching (default 8). "
+                             "Higher values are faster but get rate-limited by "
+                             "Google's thumbnail endpoint above ~12.")
+    parser.add_argument("--ocr-workers", type=int, default=0,
+                        help="Concurrent threads for Tesseract OCR (default 0 = "
+                             "auto-detect = number of CPU cores).")
     args = parser.parse_args()
 
     google_key = os.environ.get("GOOGLE_MAPS_API_KEY")
@@ -1026,6 +1323,9 @@ def main() -> int:
             do_annotate=not args.no_annotate,
             zoom_specs=args.zoom,
             write_html=True,
+            focus=args.focus,
+            fetch_workers=args.fetch_workers,
+            ocr_workers=args.ocr_workers or None,
             log=print,
         )
     except ParkingCheckError as exc:

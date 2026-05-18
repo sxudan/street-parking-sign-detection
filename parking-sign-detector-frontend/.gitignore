@@ -1,0 +1,26 @@
+node_modules/
+.expo/
+dist/
+web-build/
+*.log
+.env
+.env.local
+.DS_Store
+ios/Pods/
+ios/build/
+android/.gradle/
+android/build/
+android/app/build/
+.eas/
+
+# Yarn 4 (Berry) — keep .yarnrc.yml + releases/, ignore caches and state.
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+.pnp.*
+
+
+docs/

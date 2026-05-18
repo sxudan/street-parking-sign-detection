@@ -1,0 +1,61 @@
+{
+  "expo": {
+    "name": "Parking Sign Detector",
+    "slug": "parking-sign-detector",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.dreamwalk.parkingsigndetector",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "We use your location to find parking signs and live bay availability nearby.",
+        "NSCameraUsageDescription": "We use the camera so you can take a photo of a parking sign and we'll explain what it means.",
+        "NSPhotoLibraryUsageDescription": "Pick a photo of a parking sign from your library so we can explain what it means."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#ffffff"
+      },
+      "package": "com.dreamwalk.parkingsigndetector",
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "CAMERA",
+        "READ_EXTERNAL_STORAGE"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow $(PRODUCT_NAME) to access your camera so you can capture parking signs."
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Allow $(PRODUCT_NAME) to use your location to find parking near you."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow $(PRODUCT_NAME) to access your photos so you can pick a parking sign image."
+        }
+      ]
+    ],
+    "extra": {
+      "API_BASE_URL": "http://localhost:8000"
+    }
+  }
+}
