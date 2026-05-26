@@ -1,0 +1,13 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.*
+report/
+api_results/
+.git/
+.gitignore
+*.md
+tile_probe.py
